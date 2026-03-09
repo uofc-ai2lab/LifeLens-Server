@@ -1,0 +1,6 @@
+config/passwordFile
+config/secure.conf
+venv/
+.venv/
+data/
+db/lab_data.db
