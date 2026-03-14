@@ -3,4 +3,6 @@ config/secure.conf
 venv/
 .venv/
 data/
-db/lab_data.db
+db/
+__pycache__/
+.env

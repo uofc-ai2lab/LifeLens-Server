@@ -1,0 +1,386 @@
+"""
+api_server.py — LifeLens API Server (Server side)
+==================================================
+
+Endpoints:
+    POST /login                                     → authenticate, receive token
+    GET  /sessions                                  → list recent sessions (auth required)
+    GET  /sessions/active                           → current active session or null
+    GET  /sessions/{session_id}/medications         → medication rows
+    GET  /sessions/{session_id}/interventions       → intervention rows
+    GET  /sessions/{session_id}/injuries            → visual injury rows
+    GET  /sessions/{session_id}/transcript          → raw CSV download
+    GET  /sessions/{session_id}/images              → list image filenames
+    GET  /sessions/{session_id}/images/{filename}   → serve image file
+    GET  /events                                    → SSE stream (auth required)
+
+Authentication:
+    Users are defined in the server's .env file as:
+        LIFELENS_USERS=alice:password1,bob:password2
+
+    Login returns a token (UUID). All protected endpoints require:
+        Authorization: Bearer <token>
+
+    Tokens are stored in memory — they expire when the server restarts.
+    This is intentional for a small internal tool.
+"""
+
+import asyncio
+import logging
+import os
+import sqlite3
+import uuid
+from pathlib import Path
+from typing import AsyncGenerator
+
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+# ==========================
+# CONFIG
+# ==========================
+
+DB_PATH  = Path(__file__).resolve().parent.parent / "db" / "lab_data.db"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
+
+# ==========================
+# APP SETUP
+# ==========================
+
+app = FastAPI(title="LifeLens API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# ==========================
+# AUTHENTICATION
+# ==========================
+
+# Load users from environment variable at startup
+# Format: LIFELENS_USERS=alice:pass1,bob:pass2
+def _load_users() -> dict:
+    raw = os.getenv("LIFELENS_USERS", "")
+    users = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            username, password = entry.split(":", 1)
+            users[username.strip()] = password.strip()
+    return users
+
+USERS = _load_users()
+
+# In-memory token store: { token: username }
+_active_tokens: dict = {}
+
+security = HTTPBearer()
+
+def require_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """
+    FastAPI dependency — validates the Bearer token on protected endpoints.
+    Add `auth=Depends(require_auth)` to any endpoint to protect it.
+    """
+    token = credentials.credentials
+    if token not in _active_tokens:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+    return _active_tokens[token]
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/login")
+def login(body: LoginRequest):
+    """
+    Authenticate with username and password.
+    Returns a token to use as a Bearer token on all subsequent requests.
+
+    Credentials are read from the LIFELENS_USERS environment variable.
+    """
+    expected_password = USERS.get(body.username)
+    if not expected_password or body.password != expected_password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+    token = str(uuid.uuid4())
+    _active_tokens[token] = body.username
+    logger.info(f"[Auth] User '{body.username}' logged in")
+    return {"token": token, "username": body.username}
+
+
+# ==========================
+# SSE NOTIFICATION QUEUE
+# ==========================
+
+_event_queue: asyncio.Queue = asyncio.Queue()
+
+
+def notify_new_data(device_id: str, session_id: str, data_type: str):
+    """
+    Called by db_writer.py whenever new rows are inserted.
+    Also called by mqtt_receiver.py for session_start / session_end events.
+    """
+    event = {
+        "device_id":  device_id,
+        "session_id": session_id,
+        "data_type":  data_type,
+    }
+    try:
+        _event_queue.put_nowait(event)
+    except asyncio.QueueFull:
+        logger.warning("[API] SSE event queue full — event dropped")
+
+
+# ==========================
+# SSE ENDPOINT
+# ==========================
+
+def require_auth_sse(token: str = None, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))):
+    """
+    Auth dependency for the SSE endpoint only.
+    Accepts token as a query parameter because EventSource does not
+    support custom headers — Bearer token cannot be sent the normal way.
+    """
+    # Try query param first (EventSource), then Authorization header (regular requests)
+    raw_token = token or (credentials.credentials if credentials else None)
+    if not raw_token or raw_token not in _active_tokens:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid or expired token")
+    return _active_tokens[raw_token]
+
+
+@app.get("/events")
+async def events(_: str = Depends(require_auth_sse)):
+    """
+    SSE stream. The frontend opens this once and keeps it alive.
+
+    Event data_type values:
+        "medx"          → new medication rows available
+        "intervention"  → new intervention rows available
+        "visual"        → new injury rows available
+        "session_start" → a new live session has begun
+        "session_end"   → the active session has ended
+    """
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _sse_generator() -> AsyncGenerator[str, None]:
+    import json
+    while True:
+        try:
+            event = await asyncio.wait_for(_event_queue.get(), timeout=15.0)
+            yield f"data: {json.dumps(event)}\n\n"
+        except asyncio.TimeoutError:
+            yield ": heartbeat\n\n"
+
+
+# ==========================
+# SESSION ENDPOINTS
+# ==========================
+
+@app.get("/sessions/active")
+def get_active_session(_: str = Depends(require_auth)):
+    """
+    Returns the current active session, or null if none is running.
+
+    The home screen calls this on load to show a Live Session banner.
+
+    Returns:
+        { "session_id": "session_20260308_143022_jetson01", "device_id": "jetson01" }
+        or
+        { "session_id": null, "device_id": null }
+    """
+    from subscriber import session_manager
+    session_id = session_manager.get_session("jetson01")
+    if session_id:
+        return {"session_id": session_id, "device_id": "jetson01"}
+    return {"session_id": None, "device_id": None}
+
+
+@app.get("/sessions")
+def get_sessions(_: str = Depends(require_auth)):
+    """
+    List the 20 most recent sessions, most recent first.
+
+    Returns:
+        [
+            {
+                "session_id": "session_20260308_143022_jetson01",
+                "device_id":  "jetson01",
+                "created_at": "2026-03-08 14:30:22"
+            },
+            ...
+        ]
+    """
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT DISTINCT session_id, device_id, MIN(created_at) as created_at
+        FROM (
+            SELECT session_id, device_id, created_at FROM medications
+            UNION ALL
+            SELECT session_id, device_id, created_at FROM interventions
+            UNION ALL
+            SELECT session_id, device_id, created_at FROM visual_injuries
+        )
+        GROUP BY session_id
+        ORDER BY created_at DESC
+        LIMIT 20
+    """).fetchall()
+    conn.close()
+    return [_row_to_dict(row, ["session_id", "device_id", "created_at"]) for row in rows]
+
+
+# ==========================
+# DATA ENDPOINTS
+# ==========================
+
+@app.get("/sessions/{session_id}/medications")
+def get_medications(session_id: str, _: str = Depends(require_auth)):
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT id, start_time, end_time,
+               medication, medication_confidence,
+               dosage,     dosage_confidence,
+               route,      route_confidence,
+               created_at
+        FROM medications
+        WHERE session_id = ?
+        ORDER BY start_time
+    """, (session_id,)).fetchall()
+    conn.close()
+    if not rows:
+        _raise_if_session_unknown(session_id)
+    return [_row_to_dict(row, [
+        "id", "start_time", "end_time",
+        "medication", "medication_confidence",
+        "dosage",     "dosage_confidence",
+        "route",      "route_confidence",
+        "created_at",
+    ]) for row in rows]
+
+
+@app.get("/sessions/{session_id}/interventions")
+def get_interventions(session_id: str, _: str = Depends(require_auth)):
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT id, start_time, end_time,
+               event_type, event_category, entity_detected, full_text,
+               created_at
+        FROM interventions
+        WHERE session_id = ?
+        ORDER BY start_time
+    """, (session_id,)).fetchall()
+    conn.close()
+    if not rows:
+        _raise_if_session_unknown(session_id)
+    return [_row_to_dict(row, [
+        "id", "start_time", "end_time",
+        "event_type", "event_category", "entity_detected", "full_text",
+        "created_at",
+    ]) for row in rows]
+
+
+@app.get("/sessions/{session_id}/injuries")
+def get_injuries(session_id: str, _: str = Depends(require_auth)):
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT id, body_part, image_id, injury_pred, accuracy, pred_time, created_at
+        FROM visual_injuries
+        WHERE session_id = ?
+        ORDER BY pred_time
+    """, (session_id,)).fetchall()
+    conn.close()
+    if not rows:
+        _raise_if_session_unknown(session_id)
+    return [_row_to_dict(row, [
+        "id", "body_part", "image_id", "injury_pred",
+        "accuracy", "pred_time", "created_at",
+    ]) for row in rows]
+
+
+# ==========================
+# FILE ENDPOINTS
+# ==========================
+
+@app.get("/sessions/{session_id}/transcript")
+def get_transcript(session_id: str, device_id: str, _: str = Depends(require_auth)):
+    path = DATA_DIR / device_id / session_id / "anonymization.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Transcript not found")
+    return FileResponse(path=str(path), media_type="text/csv",
+                        filename=f"transcript_{session_id}.csv")
+
+
+@app.get("/sessions/{session_id}/images")
+def list_images(session_id: str, device_id: str, _: str = Depends(require_auth)):
+    session_dir = DATA_DIR / device_id / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session folder not found")
+    images = sorted([
+        f.name for f in session_dir.iterdir()
+        if f.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    ])
+    return images
+
+
+@app.get("/sessions/{session_id}/images/{filename}")
+def get_image(session_id: str, filename: str, device_id: str,
+              _: str = Depends(require_auth)):
+    path = DATA_DIR / device_id / session_id / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+    suffix = path.suffix.lower()
+    media_type = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png"
+    return FileResponse(path=str(path), media_type=media_type)
+
+
+# ==========================
+# UTILITIES
+# ==========================
+
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _row_to_dict(row: sqlite3.Row, keys: list) -> dict:
+    return {key: row[key] for key in keys}
+
+
+def _raise_if_session_unknown(session_id: str):
+    conn = _get_db()
+    exists = conn.execute("""
+        SELECT 1 FROM (
+            SELECT session_id FROM medications     WHERE session_id = ?
+            UNION
+            SELECT session_id FROM interventions   WHERE session_id = ?
+            UNION
+            SELECT session_id FROM visual_injuries WHERE session_id = ?
+        ) LIMIT 1
+    """, (session_id, session_id, session_id)).fetchone()
+    conn.close()
+    if not exists:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
