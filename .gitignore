@@ -1,5 +1,5 @@
-config/passwordFile
-config/secure.conf
+config/
+tailscale_certs/
 venv/
 .venv/
 data/

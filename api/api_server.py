@@ -33,9 +33,9 @@ import uuid
 from pathlib import Path
 from typing import AsyncGenerator
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -45,8 +45,9 @@ logger = logging.getLogger(__name__)
 # CONFIG
 # ==========================
 
-DB_PATH  = Path(__file__).resolve().parent.parent / "db" / "lab_data.db"
+DB_PATH = Path(__file__).resolve().parent.parent / "db" / "lab_data.db"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
+
 
 # ==========================
 # APP SETUP
@@ -67,6 +68,8 @@ app.add_middleware(
 
 # Load users from environment variable at startup
 # Format: LIFELENS_USERS=alice:pass1,bob:pass2
+
+
 def _load_users() -> dict:
     raw = os.getenv("LIFELENS_USERS", "")
     users = {}
@@ -76,6 +79,7 @@ def _load_users() -> dict:
             username, password = entry.split(":", 1)
             users[username.strip()] = password.strip()
     return users
+
 
 USERS = _load_users()
 
@@ -333,27 +337,88 @@ def get_transcript(session_id: str, device_id: str, _: str = Depends(require_aut
                         filename=f"transcript_{session_id}.csv")
 
 
-@app.get("/sessions/{session_id}/images")
-def list_images(session_id: str, device_id: str, _: str = Depends(require_auth)):
-    session_dir = DATA_DIR / device_id / session_id
-    if not session_dir.exists():
-        raise HTTPException(status_code=404, detail="Session folder not found")
-    images = sorted([
-        f.name for f in session_dir.iterdir()
-        if f.suffix.lower() in {".jpg", ".jpeg", ".png"}
-    ])
-    return images
+@app.get("/sessions/{session_id}/visual")
+def get_visual(session_id: str, device_id: str, _: str = Depends(require_auth)):
+    """
+    Return the latest visual_output.json for a session.
+    The frontend uses this to drive the body map injury visualization.
+    """
+    path = DATA_DIR / device_id / session_id / "visual_output.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Visual data not found")
+    return FileResponse(path=str(path), media_type="application/json")
 
 
-@app.get("/sessions/{session_id}/images/{filename}")
-def get_image(session_id: str, filename: str, device_id: str,
-              _: str = Depends(require_auth)):
-    path = DATA_DIR / device_id / session_id / filename
+@app.get("/sessions/{session_id}/images/{image_id}")
+def get_image_encrypted(session_id: str, image_id: str, device_id: str,
+                        _: str = Depends(require_auth)):
+    """
+    Serve the raw Fernet-encrypted image bytes.
+    The frontend renders these as pixel noise to show the anonymized state.
+    """
+    path = DATA_DIR / device_id / session_id / image_id
     if not path.exists():
         raise HTTPException(status_code=404, detail="Image not found")
-    suffix = path.suffix.lower()
-    media_type = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png"
-    return FileResponse(path=str(path), media_type=media_type)
+    return Response(content=path.read_bytes(), media_type="application/octet-stream")
+
+
+@app.post("/sessions/{session_id}/images/{image_id}/decrypt")
+def get_image_decrypted(session_id: str, image_id: str, device_id: str,
+                        _: str = Depends(require_auth)):
+    """
+    Decrypt and serve an image for authenticated medical staff.
+    Requires a valid Bearer token (standard login).
+    Used by the body map hover in the session view.
+    """
+    _decrypt_and_serve(session_id, image_id, device_id)
+
+
+@app.post("/sessions/{session_id}/images/{image_id}/decrypt-ahs")
+def get_image_decrypted_ahs(
+    session_id: str,
+    image_id: str,
+    device_id: str,
+    ahs_password: str = Header(..., alias="AHS-Password"),
+):
+    """
+    Decrypt and serve an image for AHS portal users.
+    Requires the AHS-Password header instead of a Bearer token.
+    The AHS password is stored in .env as AHS_PASSWORD.
+    """
+    expected = os.getenv("AHS_PASSWORD", "")
+    if not expected or ahs_password != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid AHS password",
+        )
+    return _decrypt_and_serve(session_id, image_id, device_id)
+
+
+def _decrypt_and_serve(session_id: str, image_id: str, device_id: str):
+    """
+    Shared decryption logic used by both decrypt endpoints.
+    Reads IMAGE_DECRYPT_KEY from .env, decrypts the stored image, returns JPEG bytes.
+    """
+    from cryptography.fernet import Fernet
+
+    decrypt_key = os.getenv("IMAGE_DECRYPT_KEY", "")
+    if not decrypt_key:
+        raise HTTPException(
+            status_code=500, detail="IMAGE_DECRYPT_KEY not configured")
+
+    path = DATA_DIR / device_id / session_id / image_id
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    try:
+        fernet = Fernet(decrypt_key.encode())
+        encrypted_bytes = path.read_bytes()
+        decrypted_bytes = fernet.decrypt(encrypted_bytes)
+    except Exception as e:
+        logger.error(f"[API] Image decryption failed for {image_id}: {e}")
+        raise HTTPException(status_code=500, detail="Image decryption failed")
+
+    return Response(content=decrypted_bytes, media_type="image/jpeg")
 
 
 # ==========================
@@ -383,4 +448,5 @@ def _raise_if_session_unknown(session_id: str):
     """, (session_id, session_id, session_id)).fetchone()
     conn.close()
     if not exists:
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Session '{session_id}' not found")

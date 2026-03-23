@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 
 # These data types get saved to disk AND inserted into the database
-FRONTEND_DATA_TYPES = {"medx", "intervention", "visual"}
+FRONTEND_DATA_TYPES = {"medx", "intervention"}
 
 # Canonical filenames on the server — we don't trust incoming filenames for naming
 FILENAME_MAP = {

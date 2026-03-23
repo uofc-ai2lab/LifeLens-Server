@@ -46,8 +46,8 @@ logger = logging.getLogger(__name__)
 # CONFIG
 # ==========================
 
-BROKER   = "100.77.50.93"   # Tailscale IP (matches secure.conf)
-PORT     = 1883
+BROKER = "100.77.50.93"   # Tailscale IP (matches secure.conf)
+PORT = 1883
 USERNAME = "Jetson"
 PASSWORD = "Secure123"
 
@@ -55,6 +55,7 @@ PASSWORD = "Secure123"
 TOPICS = [
     ("lab/session/#", 1),
     ("lab/ingest/#",  1),
+    ("lab/heartbeat/#", 1)
 ]
 
 
@@ -66,6 +67,7 @@ TOPICS = [
 # notify connected frontend clients when new data arrives in the database.
 # If api_server.py is not running, it stays None and notifications are skipped.
 _on_new_data_callback = None
+
 
 def set_on_new_data_callback(callback):
     """
@@ -97,7 +99,8 @@ def on_connect(client, userdata, flags, rc):
 
 def on_disconnect(client, userdata, rc):
     if rc != 0:
-        logger.warning(f"[Receiver] Unexpected disconnect (rc={rc}) — paho will retry")
+        logger.warning(
+            f"[Receiver] Unexpected disconnect (rc={rc}) — paho will retry")
     else:
         logger.info("[Receiver] Clean disconnect")
 
@@ -112,14 +115,21 @@ def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        logger.error(f"[Receiver] Failed to decode message on topic '{topic}': {e}")
+        logger.error(
+            f"[Receiver] Failed to decode message on topic '{topic}': {e}")
         return
 
     logger.debug(f"[Receiver] Message on '{topic}'")
 
+    # Handle heartbeat messages (liveness tracking)
+    if topic.startswith("lab/heartbeat/"):
+        session_manager.update_heartbeat()
+        return  # Do NOT route further
+
     parts = topic.split("/")
     is_session_message = (
-        len(parts) == 4 and parts[1] == "session" and parts[2] in ("start", "end")
+        len(parts) == 4 and parts[1] == "session" and parts[2] in (
+            "start", "end")
     )
 
     # For session_end: capture the session_id BEFORE routing closes the session
@@ -165,9 +175,9 @@ def start():
     client = mqtt.Client(client_id="lifelens-server")
     client.username_pw_set(USERNAME, PASSWORD)
 
-    client.on_connect    = on_connect
+    client.on_connect = on_connect
     client.on_disconnect = on_disconnect
-    client.on_message    = on_message
+    client.on_message = on_message
 
     client.connect(BROKER, PORT, keepalive=60)
 

@@ -28,13 +28,10 @@ from typing import Callable, Optional
 
 from . import csv_handler
 from . import image_handler
+from . import json_handler
 from . import session_manager
 
 logger = logging.getLogger(__name__)
-
-# Data types that are image files rather than CSVs
-IMAGE_DATA_TYPES = {"image"}
-
 
 # ==========================
 # PUBLIC ENTRY POINT
@@ -174,12 +171,19 @@ def _dispatch_file(
         logger.error(f"[Router] Failed to decode base64 for '{data_type}': {e}")
         return
 
-    if data_type in IMAGE_DATA_TYPES:
+    if data_type == 'image':
         image_handler.handle(
             device_id=device_id,
             session_id=session_id,
             filename=filename,
             file_bytes=file_bytes,
+        )
+    elif data_type == "visual":
+        json_handler.handle(
+            device_id=device_id,
+            session_id=session_id,
+            file_bytes=file_bytes,
+            on_new_data=on_new_data,
         )
     else:
         csv_handler.handle(
