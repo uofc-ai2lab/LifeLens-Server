@@ -25,8 +25,6 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import db_writer
-from dotenv import load_dotenv
-load_dotenv()  # loads .env into environment before anything else runs
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +42,6 @@ FILENAME_MAP = {
     "anonymization": "anonymization.csv",
     "medx":          "medx.csv",
     "intervention":  "intervention.csv",
-    "visual":        "visual.csv",
 }
 
 

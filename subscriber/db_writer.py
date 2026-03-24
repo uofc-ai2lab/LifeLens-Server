@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path(__file__).resolve().parent.parent / "db" / "lab_data.db"
 
 # Data types this module handles — anything else is ignored
-FRONTEND_DATA_TYPES = {"medx", "intervention", "visual"}
+FRONTEND_DATA_TYPES = {"medx", "intervention"}
 
 
 # ==========================
@@ -83,20 +83,6 @@ def init_db():
         )
     """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS visual_injuries (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_id    TEXT    NOT NULL,
-            session_id   TEXT    NOT NULL,
-            body_part    TEXT,
-            image_id     TEXT,
-            injury_pred  TEXT,
-            accuracy     REAL,
-            pred_time    TEXT,
-            created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
     conn.commit()
     conn.close()
     logger.info("[DB] Database initialized")
@@ -141,8 +127,6 @@ def write(
             _insert_medications(device_id, session_id, rows)
         elif data_type == "intervention":
             _insert_interventions(device_id, session_id, rows)
-        elif data_type == "visual":
-            _insert_visual_injuries(device_id, session_id, rows)
 
         logger.info(f"[DB] Inserted {len(rows)} row(s) into {data_type} table")
 
@@ -234,37 +218,6 @@ def _insert_interventions(device_id: str, session_id: str, rows: list):
 
     conn.commit()
     conn.close()
-
-
-def _insert_visual_injuries(device_id: str, session_id: str, rows: list):
-    """
-    Insert rows from a visual output CSV into the visual_injuries table.
-
-    Expected CSV columns (from visual_output.csv):
-        body_part, image_id, injury_pred, accuracy, pred_time
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    for row in rows:
-        cursor.execute("""
-            INSERT INTO visual_injuries
-                (device_id, session_id, body_part, image_id,
-                 injury_pred, accuracy, pred_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            device_id,
-            session_id,
-            row.get("body_part", ""),
-            row.get("image_id", ""),
-            row.get("injury_pred", ""),
-            _safe_float(row.get("accuracy", "")),
-            row.get("pred_time", ""),
-        ))
-
-    conn.commit()
-    conn.close()
-
 
 # ==========================
 # UTILITIES

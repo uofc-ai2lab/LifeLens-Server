@@ -8,7 +8,6 @@ Endpoints:
     GET  /sessions/active                           → current active session or null
     GET  /sessions/{session_id}/medications         → medication rows
     GET  /sessions/{session_id}/interventions       → intervention rows
-    GET  /sessions/{session_id}/injuries            → visual injury rows
     GET  /sessions/{session_id}/transcript          → raw CSV download
     GET  /sessions/{session_id}/images              → list image filenames
     GET  /sessions/{session_id}/images/{filename}   → serve image file
@@ -28,10 +27,14 @@ Authentication:
 import asyncio
 import logging
 import os
+import queue
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator
+from datetime import datetime
+from subscriber.session_manager import get_active_device_id, get_session
+
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -88,6 +91,7 @@ _active_tokens: dict = {}
 
 security = HTTPBearer()
 
+
 def require_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """
     FastAPI dependency — validates the Bearer token on protected endpoints.
@@ -131,23 +135,23 @@ def login(body: LoginRequest):
 # SSE NOTIFICATION QUEUE
 # ==========================
 
-_event_queue: asyncio.Queue = asyncio.Queue()
+_event_queue: queue.Queue = queue.Queue()
 
 
 def notify_new_data(device_id: str, session_id: str, data_type: str):
     """
     Called by db_writer.py whenever new rows are inserted.
     Also called by mqtt_receiver.py for session_start / session_end events.
+
+    This function is called from the MQTT thread, not the async event loop,
+    so we use queue.Queue (thread-safe) rather than asyncio.Queue.
     """
     event = {
         "device_id":  device_id,
         "session_id": session_id,
         "data_type":  data_type,
     }
-    try:
-        _event_queue.put_nowait(event)
-    except asyncio.QueueFull:
-        logger.warning("[API] SSE event queue full — event dropped")
+    _event_queue.put_nowait(event)
 
 
 # ==========================
@@ -192,11 +196,16 @@ async def events(_: str = Depends(require_auth_sse)):
 
 async def _sse_generator() -> AsyncGenerator[str, None]:
     import json
+    loop = asyncio.get_event_loop()
     while True:
         try:
-            event = await asyncio.wait_for(_event_queue.get(), timeout=15.0)
+            # run_in_executor moves the blocking queue.get() off the event loop
+            # thread so uvicorn is never stalled waiting for a message.
+            event = await loop.run_in_executor(
+                None, lambda: _event_queue.get(timeout=15.0)
+            )
             yield f"data: {json.dumps(event)}\n\n"
-        except asyncio.TimeoutError:
+        except queue.Empty:
             yield ": heartbeat\n\n"
 
 
@@ -216,10 +225,12 @@ def get_active_session(_: str = Depends(require_auth)):
         or
         { "session_id": null, "device_id": null }
     """
-    from subscriber import session_manager
-    session_id = session_manager.get_session("jetson01")
+    device_id = get_active_device_id()
+    if not device_id:
+        return {"session_id": None, "device_id": None}
+    session_id = get_session(device_id)
     if session_id:
-        return {"session_id": session_id, "device_id": "jetson01"}
+        return {"session_id": session_id, "device_id": device_id}
     return {"session_id": None, "device_id": None}
 
 
@@ -238,22 +249,31 @@ def get_sessions(_: str = Depends(require_auth)):
             ...
         ]
     """
-    conn = _get_db()
-    rows = conn.execute("""
-        SELECT DISTINCT session_id, device_id, MIN(created_at) as created_at
-        FROM (
-            SELECT session_id, device_id, created_at FROM medications
-            UNION ALL
-            SELECT session_id, device_id, created_at FROM interventions
-            UNION ALL
-            SELECT session_id, device_id, created_at FROM visual_injuries
-        )
-        GROUP BY session_id
-        ORDER BY created_at DESC
-        LIMIT 20
-    """).fetchall()
-    conn.close()
-    return [_row_to_dict(row, ["session_id", "device_id", "created_at"]) for row in rows]
+    sessions = []
+    if DATA_DIR.exists():
+        for device_dir in sorted(DATA_DIR.iterdir()):
+            if not device_dir.is_dir():
+                continue
+            for session_dir in sorted(device_dir.iterdir()):
+                if not session_dir.is_dir():
+                    continue
+                session_id = session_dir.name
+                device_id = device_dir.name
+                try:
+                    parts = session_id.split("_")
+                    created_at = datetime.strptime(
+                        f"{parts[1]} {parts[2]}", "%Y%m%d %H%M%S"
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                except (IndexError, ValueError):
+                    created_at = ""
+                sessions.append({
+                    "session_id": session_id,
+                    "device_id":  device_id,
+                    "created_at": created_at,
+                })
+
+    sessions.sort(key=lambda s: s["created_at"], reverse=True)
+    return sessions[:20]
 
 
 # ==========================
@@ -305,28 +325,10 @@ def get_interventions(session_id: str, _: str = Depends(require_auth)):
         "created_at",
     ]) for row in rows]
 
-
-@app.get("/sessions/{session_id}/injuries")
-def get_injuries(session_id: str, _: str = Depends(require_auth)):
-    conn = _get_db()
-    rows = conn.execute("""
-        SELECT id, body_part, image_id, injury_pred, accuracy, pred_time, created_at
-        FROM visual_injuries
-        WHERE session_id = ?
-        ORDER BY pred_time
-    """, (session_id,)).fetchall()
-    conn.close()
-    if not rows:
-        _raise_if_session_unknown(session_id)
-    return [_row_to_dict(row, [
-        "id", "body_part", "image_id", "injury_pred",
-        "accuracy", "pred_time", "created_at",
-    ]) for row in rows]
-
-
 # ==========================
 # FILE ENDPOINTS
 # ==========================
+
 
 @app.get("/sessions/{session_id}/transcript")
 def get_transcript(session_id: str, device_id: str, _: str = Depends(require_auth)):
@@ -362,6 +364,25 @@ def get_image_encrypted(session_id: str, image_id: str, device_id: str,
     return Response(content=path.read_bytes(), media_type="application/octet-stream")
 
 
+@app.get("/sessions/{session_id}/images")
+def list_images(session_id: str, device_id: str, _: str = Depends(require_auth)):
+    """
+    List all image IDs available for a session.
+    Returns filenames only — use /images/{image_id} to fetch each one.
+    """
+    session_dir = DATA_DIR / device_id / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Exclude the CSV and JSON data files — only return image files
+    excluded = {".csv", ".json"}
+    images = [
+        p.name for p in sorted(session_dir.iterdir())
+        if p.is_file() and p.suffix not in excluded
+    ]
+    return {"images": images}
+
+
 @app.post("/sessions/{session_id}/images/{image_id}/decrypt")
 def get_image_decrypted(session_id: str, image_id: str, device_id: str,
                         _: str = Depends(require_auth)):
@@ -370,7 +391,7 @@ def get_image_decrypted(session_id: str, image_id: str, device_id: str,
     Requires a valid Bearer token (standard login).
     Used by the body map hover in the session view.
     """
-    _decrypt_and_serve(session_id, image_id, device_id)
+    return _decrypt_and_serve(session_id, image_id, device_id)
 
 
 @app.post("/sessions/{session_id}/images/{image_id}/decrypt-ahs")

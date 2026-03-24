@@ -14,6 +14,9 @@ The two components are connected via the notify_new_data callback:
     db_writer → notify_new_data() → SSE queue → frontend
 """
 
+from dotenv import load_dotenv
+load_dotenv()  # Must be first — loads .env before any module reads os.getenv()
+
 import logging
 import threading
 import uvicorn
@@ -21,7 +24,7 @@ import time
 
 from subscriber.mqtt_receiver import start as start_mqtt, set_on_new_data_callback
 from api.api_server import app, notify_new_data
-from subscriber.session_manager import set_session_event_callback, get_session
+from subscriber.session_manager import set_session_event_callback, get_session, get_active_device_id
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,8 +39,10 @@ def session_watcher():
     This ensures SSE updates fire even if no API calls are made.
     """
     while True:
-        get_session("jetson01")
-        time.sleep(5)  # check every 5 seconds
+        device_id = get_active_device_id()
+        if device_id:
+            get_session(device_id)
+            time.sleep(5)
 
 def main():
     # Wire up the SSE notification callback before starting either service

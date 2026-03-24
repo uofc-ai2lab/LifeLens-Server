@@ -63,6 +63,12 @@ def close_session(device_id: str):
     if _on_session_event:
         _on_session_event(device_id, session_id, "session_end")
 
+def get_active_device_id() -> Optional[str]:
+    """Extract device_id from the active session_id string, or None if no session."""
+    if not _active_session_id:
+        return None
+    # Format: session_{date}_{time}_{device_id}
+    return "_".join(_active_session_id.split("_")[3:])
 
 def get_session(device_id: str) -> Optional[str]:
     """

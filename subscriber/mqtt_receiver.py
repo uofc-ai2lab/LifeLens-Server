@@ -127,16 +127,9 @@ def on_message(client, userdata, msg):
         return  # Do NOT route further
 
     parts = topic.split("/")
-    is_session_message = (
-        len(parts) == 4 and parts[1] == "session" and parts[2] in (
-            "start", "end")
+    is_session_start = (
+        len(parts) == 4 and parts[1] == "session" and parts[2] == "start"
     )
-
-    # For session_end: capture the session_id BEFORE routing closes the session
-    session_id_before_route = None
-    if is_session_message and parts[2] == "end":
-        device_id = payload.get("device_id", parts[3])
-        session_id_before_route = session_manager.get_session(device_id)
 
     router.route(
         topic=topic,
@@ -144,20 +137,13 @@ def on_message(client, userdata, msg):
         on_new_data=_on_new_data_callback,
     )
 
-    # Forward session start/end as SSE events with the correct session_id
-    # so the frontend can navigate to the right session and filter events correctly
-    if _on_new_data_callback and is_session_message:
+    # Forward session_start as an SSE event so the frontend can navigate to
+    # the new session. session_end is already fired inside
+    # session_manager.close_session() — firing it here too would double-send.
+    if _on_new_data_callback and is_session_start:
         device_id = payload.get("device_id", parts[3])
-        data_type = "session_start" if parts[2] == "start" else "session_end"
-
-        if parts[2] == "start":
-            # Session was just opened by router — get_session() returns the new id
-            session_id = session_manager.get_session(device_id) or ""
-        else:
-            # Session was just closed by router — use the id we captured before routing
-            session_id = session_id_before_route or ""
-
-        _on_new_data_callback(device_id, session_id, data_type)
+        session_id = session_manager.get_session(device_id) or ""
+        _on_new_data_callback(device_id, session_id, "session_start")
 
 
 # ==========================
