@@ -31,6 +31,7 @@ import queue
 import sqlite3
 import uuid
 from pathlib import Path
+import threading
 from typing import AsyncGenerator
 from datetime import datetime
 from subscriber.session_manager import get_active_device_id, get_session
@@ -135,7 +136,8 @@ def login(body: LoginRequest):
 # SSE NOTIFICATION QUEUE
 # ==========================
 
-_event_queue: queue.Queue = queue.Queue()
+_sse_clients: list[queue.Queue] = []
+_sse_clients_lock = threading.Lock()
 
 
 def notify_new_data(device_id: str, session_id: str, data_type: str):
@@ -146,17 +148,16 @@ def notify_new_data(device_id: str, session_id: str, data_type: str):
     This function is called from the MQTT thread, not the async event loop,
     so we use queue.Queue (thread-safe) rather than asyncio.Queue.
     """
-    event = {
-        "device_id":  device_id,
-        "session_id": session_id,
-        "data_type":  data_type,
-    }
-    _event_queue.put_nowait(event)
-
+    event = {"device_id": device_id,
+             "session_id": session_id, "data_type": data_type}
+    with _sse_clients_lock:
+        for client_queue in _sse_clients:
+            client_queue.put_nowait(event)   # every client gets every event
 
 # ==========================
 # SSE ENDPOINT
 # ==========================
+
 
 def require_auth_sse(token: str = None, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))):
     """
@@ -196,22 +197,27 @@ async def events(_: str = Depends(require_auth_sse)):
 
 async def _sse_generator() -> AsyncGenerator[str, None]:
     import json
-    loop = asyncio.get_event_loop()
-    while True:
-        try:
-            # run_in_executor moves the blocking queue.get() off the event loop
-            # thread so uvicorn is never stalled waiting for a message.
-            event = await loop.run_in_executor(
-                None, lambda: _event_queue.get(timeout=15.0)
-            )
-            yield f"data: {json.dumps(event)}\n\n"
-        except queue.Empty:
-            yield ": heartbeat\n\n"
-
+    client_queue = queue.Queue()
+    with _sse_clients_lock:
+        _sse_clients.append(client_queue)    # register on connect
+    try:
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                event = await loop.run_in_executor(
+                    None, lambda: client_queue.get(timeout=15.0)
+                )
+                yield f"data: {json.dumps(event)}\n\n"
+            except queue.Empty:
+                yield ": heartbeat\n\n"
+    finally:
+        with _sse_clients_lock:
+            _sse_clients.remove(client_queue)  # clean up on disconnect
 
 # ==========================
 # SESSION ENDPOINTS
 # ==========================
+
 
 @app.get("/sessions/active")
 def get_active_session(_: str = Depends(require_auth)):
