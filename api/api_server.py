@@ -71,7 +71,7 @@ app.add_middleware(
 # ==========================
 
 # Load users from environment variable at startup
-# Format: LIFELENS_USERS=alice:pass1,bob:pass2
+# Format: LIFELENS_USERS=username:display_name:password,...
 
 
 def _load_users() -> dict:
@@ -79,9 +79,22 @@ def _load_users() -> dict:
     users = {}
     for entry in raw.split(","):
         entry = entry.strip()
-        if ":" in entry:
-            username, password = entry.split(":", 1)
-            users[username.strip()] = password.strip()
+        if not entry:
+            continue
+
+        parts = [part.strip() for part in entry.split(":", 2)]
+        if len(parts) == 3:
+            username, display_name, password = parts
+        elif len(parts) == 2:
+            username, password = parts
+            display_name = username
+        else:
+            continue
+
+        users[username] = {
+            "password": password,
+            "display_name": display_name,
+        }
     return users
 
 
@@ -120,8 +133,8 @@ def login(body: LoginRequest):
 
     Credentials are read from the LIFELENS_USERS environment variable.
     """
-    expected_password = USERS.get(body.username)
-    if not expected_password or body.password != expected_password:
+    user = USERS.get(body.username)
+    if not user or body.password != user["password"]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
@@ -129,7 +142,11 @@ def login(body: LoginRequest):
     token = str(uuid.uuid4())
     _active_tokens[token] = body.username
     logger.info(f"[Auth] User '{body.username}' logged in")
-    return {"token": token, "username": body.username}
+    return {
+        "token": token,
+        "username": body.username,
+        "display_name": user["display_name"],
+    }
 
 
 # ==========================
