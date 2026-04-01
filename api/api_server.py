@@ -37,7 +37,7 @@ from datetime import datetime
 from subscriber.session_manager import get_active_device_id, get_session
 
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -159,14 +159,11 @@ def notify_new_data(device_id: str, session_id: str, data_type: str):
 # ==========================
 
 
-def require_auth_sse(token: str = None, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))):
-    """
-    Auth dependency for the SSE endpoint only.
-    Accepts token as a query parameter because EventSource does not
-    support custom headers — Bearer token cannot be sent the normal way.
-    """
-    # Try query param first (EventSource), then Authorization header (regular requests)
-    raw_token = token or (credentials.credentials if credentials else None)
+def require_auth_sse(
+    credentials: HTTPAuthorizationCredentials | None = Depends(
+        HTTPBearer(auto_error=False)),
+):
+    raw_token = credentials.credentials if credentials else None
     if not raw_token or raw_token not in _active_tokens:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="Invalid or expired token")
@@ -469,10 +466,8 @@ def _raise_if_session_unknown(session_id: str):
             SELECT session_id FROM medications     WHERE session_id = ?
             UNION
             SELECT session_id FROM interventions   WHERE session_id = ?
-            UNION
-            SELECT session_id FROM visual_injuries WHERE session_id = ?
         ) LIMIT 1
-    """, (session_id, session_id, session_id)).fetchone()
+    """, (session_id, session_id)).fetchone()
     conn.close()
     if not exists:
         raise HTTPException(

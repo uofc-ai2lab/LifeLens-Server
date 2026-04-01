@@ -11,7 +11,6 @@ Responsible for:
 Only called by csv_handler.py, and only for these three data types:
     - "medx"         → medications table
     - "intervention" → interventions table
-    - "visual"       → visual_injuries table
 
 The anonymization (transcript) CSV is NOT parsed here — it is served
 as a raw file download by the API.
@@ -105,14 +104,15 @@ def write(
     Args:
         device_id:    Jetson device identifier (e.g. "jetson01")
         session_id:   Server-generated session identifier
-        data_type:    One of "medx", "intervention", "visual"
+        data_type:    One of "medx", "intervention"
         csv_content:  Raw bytes of the CSV file
         on_new_data:  Optional callback fired after successful insert,
                       used by api_server.py to trigger an SSE notification.
                       Signature: on_new_data(device_id, session_id, data_type)
     """
     if data_type not in FRONTEND_DATA_TYPES:
-        logger.warning(f"[DB] data_type '{data_type}' is not a frontend CSV — skipping")
+        logger.warning(
+            f"[DB] data_type '{data_type}' is not a frontend CSV — skipping")
         return
 
     try:
@@ -120,7 +120,8 @@ def write(
         rows = list(csv.DictReader(StringIO(text)))
 
         if not rows:
-            logger.warning(f"[DB] CSV for {data_type} is empty — nothing to insert")
+            logger.warning(
+                f"[DB] CSV for {data_type} is empty — nothing to insert")
             return
 
         if data_type == "medx":
@@ -159,8 +160,8 @@ def _insert_medications(device_id: str, session_id: str, rows: list):
         # Column headers include confidence scores, e.g. "medication (confidence score)"
         # We find the right column flexibly rather than hardcoding the exact header string
         medication_col = _find_col(row, "medication")
-        dosage_col     = _find_col(row, "dosage")
-        route_col      = _find_col(row, "route")
+        dosage_col = _find_col(row, "dosage")
+        route_col = _find_col(row, "route")
 
         # Values look like: "fentanyl (0.900)" — split name from score, cast score to float
         medication, med_conf = _split_confidence(row.get(medication_col, ""))
@@ -222,6 +223,7 @@ def _insert_interventions(device_id: str, session_id: str, rows: list):
 # ==========================
 # UTILITIES
 # ==========================
+
 
 def _find_col(row: dict, keyword: str) -> str:
     """

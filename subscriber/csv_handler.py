@@ -10,7 +10,6 @@ Responsible for:
 Frontend CSVs (parsed into DB):
     - "medx"         → saved as medx.csv         + inserted into medications table
     - "intervention" → saved as intervention.csv  + inserted into interventions table
-    - "visual"       → saved as visual.csv        + inserted into visual_injuries table
 
 Non-frontend CSV (saved to disk only):
     - "anonymization" → saved as anonymization.csv (served as raw file download)
@@ -44,10 +43,10 @@ FILENAME_MAP = {
     "intervention":  "intervention.csv",
 }
 
-
 # ==========================
 # PUBLIC ENTRY POINT
 # ==========================
+
 
 def handle(
     device_id: str,
@@ -71,7 +70,7 @@ def handle(
     """
     try:
         session_dir = _get_session_dir(device_id, session_id)
-        save_path   = _get_save_path(session_dir, data_type, filename)
+        save_path = _get_save_path(session_dir, data_type, filename)
 
         _append_csv(save_path, file_bytes)
         logger.info(f"[CSV] Saved → {save_path}")
@@ -87,7 +86,8 @@ def handle(
             )
 
     except Exception as e:
-        logger.error(f"[CSV] Failed to handle {data_type} for {device_id}/{session_id}: {e}")
+        logger.error(
+            f"[CSV] Failed to handle {data_type} for {device_id}/{session_id}: {e}")
 
 
 # ==========================
@@ -120,7 +120,8 @@ def _get_save_path(session_dir: Path, data_type: str, original_filename: str) ->
         return session_dir / canonical
 
     # Unrecognized data type — use original name as a safe fallback
-    logger.warning(f"[CSV] Unrecognized data_type '{data_type}', using original filename")
+    logger.warning(
+        f"[CSV] Unrecognized data_type '{data_type}', using original filename")
     return session_dir / original_filename
 
 
@@ -145,8 +146,10 @@ def _append_csv(save_path: Path, file_bytes: bytes):
             return
         with open(save_path, "ab") as f:
             f.write(("\n".join(lines_to_write) + "\n").encode("utf-8"))
-        logger.info(f"[CSV] Appended {len(lines_to_write)} row(s) to {save_path.name}")
+        logger.info(
+            f"[CSV] Appended {len(lines_to_write)} row(s) to {save_path.name}")
     else:
         with open(save_path, "wb") as f:
             f.write(("\n".join(lines) + "\n").encode("utf-8"))
-        logger.info(f"[CSV] Created {save_path.name} with {len(lines) - 1} row(s)")
+        logger.info(
+            f"[CSV] Created {save_path.name} with {len(lines) - 1} row(s)")

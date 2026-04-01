@@ -48,4 +48,5 @@ def handle(
         logger.info(f"[Image] Saved → {save_path}")
 
     except Exception as e:
-        logger.error(f"[Image] Failed to save image '{filename}' for {device_id}/{session_id}: {e}") 
+        logger.error(
+            f"[Image] Failed to save image '{filename}' for {device_id}/{session_id}: {e}")

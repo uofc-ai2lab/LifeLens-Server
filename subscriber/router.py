@@ -15,7 +15,7 @@ Topic structure:
     lab/session/start/{device_id}     → session_manager.open_session()
     lab/session/end/{device_id}       → session_manager.close_session()
     lab/ingest/audio/{device_id}      → batch of audio CSVs
-    lab/ingest/video/{device_id}      → visual CSV + image
+    lab/ingest/video/{device_id}      → injuries stored in a JSON + images
 
 Data types by pipeline:
     audio: anonymization, medx, intervention  (all CSVs)
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # ==========================
 # PUBLIC ENTRY POINT
 # ==========================
+
 
 def route(
     topic: str,
@@ -67,7 +68,8 @@ def route(
         _route_ingest(parts, payload, on_new_data)
 
     else:
-        logger.warning(f"[Router] Unknown topic namespace '{namespace}': {topic}")
+        logger.warning(
+            f"[Router] Unknown topic namespace '{namespace}': {topic}")
 
 
 # ==========================
@@ -86,7 +88,7 @@ def _route_session(parts: list, payload: dict):
         logger.warning(f"[Router] Malformed session topic: {'/'.join(parts)}")
         return
 
-    action    = parts[2]  # "start" or "end"
+    action = parts[2]  # "start" or "end"
     device_id = parts[3]
 
     if action == "start":
@@ -126,10 +128,12 @@ def _route_ingest(parts: list, payload: dict, on_new_data: Optional[Callable]):
 
     files = payload.get("files", [])
     if not files:
-        logger.warning(f"[Router] Ingest message from '{device_id}' has no files")
+        logger.warning(
+            f"[Router] Ingest message from '{device_id}' has no files")
         return
 
-    logger.info(f"[Router] Routing batch of {len(files)} file(s) for {device_id}/{session_id}")
+    logger.info(
+        f"[Router] Routing batch of {len(files)} file(s) for {device_id}/{session_id}")
 
     for file_entry in files:
         _dispatch_file(device_id, session_id, file_entry, on_new_data)
@@ -153,7 +157,7 @@ def _dispatch_file(
         }
     """
     data_type = file_entry.get("data_type", "")
-    filename  = file_entry.get("filename", "unknown")
+    filename = file_entry.get("filename", "unknown")
     bytes_b64 = file_entry.get("bytes_b64", "")
 
     if not data_type:
@@ -161,14 +165,16 @@ def _dispatch_file(
         return
 
     if not bytes_b64:
-        logger.warning(f"[Router] File entry for '{data_type}' has no bytes — skipping")
+        logger.warning(
+            f"[Router] File entry for '{data_type}' has no bytes — skipping")
         return
 
     # Decode base64 bytes once here — handlers receive raw bytes
     try:
         file_bytes = base64.b64decode(bytes_b64)
     except Exception as e:
-        logger.error(f"[Router] Failed to decode base64 for '{data_type}': {e}")
+        logger.error(
+            f"[Router] Failed to decode base64 for '{data_type}': {e}")
         return
 
     if data_type == 'image':

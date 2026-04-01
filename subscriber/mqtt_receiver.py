@@ -12,23 +12,21 @@ It is intentionally thin — its only responsibilities are:
 
 All routing, file handling, and database logic lives in the other modules.
 
-To run:
-    python -m subscriber.mqtt_receiver
-
 Topics subscribed:
     lab/session/#      → session start/end messages
     lab/ingest/#       → data batch messages (audio + video)
+    lab/heartbeat/#    → heartbeat / liveness messages
 """
 
 import json
 import logging
-import logging.config
 
 import paho.mqtt.client as mqtt
 
 from . import router
 from . import db_writer
 from . import session_manager
+from subscriber.settings import BROKER, PORT, USERNAME, PASSWORD
 
 # ==========================
 # LOGGING
@@ -40,16 +38,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-
-# ==========================
-# CONFIG
-# ==========================
-
-BROKER = "100.77.50.93"   # Tailscale IP (matches secure.conf)
-PORT = 1883
-USERNAME = "Jetson"
-PASSWORD = "Secure123"
 
 # Subscribe to all session and ingest topics in one wildcard each
 TOPICS = [
@@ -158,7 +146,7 @@ def start():
     logger.info("[Receiver] Initializing database...")
     db_writer.init_db()
 
-    client = mqtt.Client(client_id="lifelens-server")
+    client = mqtt.Client(client_id="LifeLens Server")
     client.username_pw_set(USERNAME, PASSWORD)
 
     client.on_connect = on_connect

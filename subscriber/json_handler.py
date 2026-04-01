@@ -52,4 +52,5 @@ def handle(
             on_new_data(device_id, session_id, "visual")
 
     except Exception as e:
-        logger.error(f"[JSON] Failed to save visual data for {device_id}/{session_id}: {e}")
+        logger.error(
+            f"[JSON] Failed to save visual data for {device_id}/{session_id}: {e}")
