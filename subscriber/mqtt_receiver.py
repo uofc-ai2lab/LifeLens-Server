@@ -1,153 +1,163 @@
-import os
+"""
+mqtt_receiver.py — LifeLens MQTT Receiver (Server side, entry point)
+=====================================================================
+
+This is the entry point for the server-side data ingestion pipeline.
+It is intentionally thin — its only responsibilities are:
+
+    1. Connect to the MQTT broker
+    2. Subscribe to all relevant topics
+    3. Decode incoming JSON payloads
+    4. Hand off to router.py — nothing else
+
+All routing, file handling, and database logic lives in the other modules.
+
+Topics subscribed:
+    lab/session/#      → session start/end messages
+    lab/ingest/#       → data batch messages (audio + video)
+    lab/heartbeat/#    → heartbeat / liveness messages
+"""
+
 import json
-import base64
-import sqlite3
-from pathlib import Path
+import logging
+
 import paho.mqtt.client as mqtt
 
-# ==========================
-# CONFIG
-# ==========================
-
-BROKER = "100.77.50.93"   # Tailscale IP
-PORT = 1883
-USERNAME = "Jetson"
-PASSWORD = "Secure123"
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-INCOMING_DIR = BASE_DIR / "data" / "incoming"
-AUDIO_DIR = BASE_DIR / "data" / "audio"
-VIDEO_DIR = BASE_DIR / "data" / "video"
-DB_PATH = BASE_DIR / "db" / "lab_data.db"
-
-TOPIC = "lab/ingest/#"
+from . import router
+from . import db_writer
+from . import session_manager
+from subscriber.settings import BROKER, PORT, USERNAME, PASSWORD
 
 # ==========================
-# DATABASE SETUP
+# LOGGING
 # ==========================
 
-def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+# Subscribe to all session and ingest topics in one wildcard each
+TOPICS = [
+    ("lab/session/#", 1),
+    ("lab/ingest/#",  1),
+    ("lab/heartbeat/#", 1)
+]
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS measurements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_id TEXT,
-            file_type TEXT,
-            filename TEXT,
-            content BLOB
-        )
-    """)
 
-    conn.commit()
-    conn.close()
+# ==========================
+# SSE NOTIFICATION CALLBACK
+# ==========================
+
+# This callback is set by api_server.py at startup so the receiver can
+# notify connected frontend clients when new data arrives in the database.
+# If api_server.py is not running, it stays None and notifications are skipped.
+_on_new_data_callback = None
+
+
+def set_on_new_data_callback(callback):
+    """
+    Register the SSE notification callback from api_server.py.
+
+    Args:
+        callback: Callable with signature (device_id, session_id, data_type)
+    """
+    global _on_new_data_callback
+    _on_new_data_callback = callback
+    logger.info("[Receiver] SSE notification callback registered")
+
 
 # ==========================
 # MQTT CALLBACKS
 # ==========================
 
 def on_connect(client, userdata, flags, rc):
-    print("Connected with result code", rc)
-    client.subscribe(TOPIC)
+    if rc == 0:
+        logger.info(f"[Receiver] Connected to broker at {BROKER}:{PORT}")
+        # Subscribe inside on_connect so subscriptions are restored automatically
+        # if the client reconnects after a dropped connection
+        for topic, qos in TOPICS:
+            client.subscribe(topic, qos)
+            logger.info(f"[Receiver] Subscribed to: {topic}")
+    else:
+        logger.error(f"[Receiver] Connection refused, return code: {rc}")
+
+
+def on_disconnect(client, userdata, rc):
+    if rc != 0:
+        logger.warning(
+            f"[Receiver] Unexpected disconnect (rc={rc}) — paho will retry")
+    else:
+        logger.info("[Receiver] Clean disconnect")
+
 
 def on_message(client, userdata, msg):
+    """
+    Called by paho for every incoming message.
+    Decode the JSON payload and pass to router — nothing else.
+    """
+    topic = msg.topic
+
     try:
-        payload = json.loads(msg.payload.decode())
-        device_id = payload["device_id"]
-        filename = payload["filename"]
-        index = payload["index"]
-        total = payload["total"]
-        file_bytes = base64.b64decode(payload["bytes_b64"])
+        payload = json.loads(msg.payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        logger.error(
+            f"[Receiver] Failed to decode message on topic '{topic}': {e}")
+        return
 
-        # Extract file type from topic
-        # lab/ingest/audio/device01
-        parts = msg.topic.split("/")
-        file_type = parts[2]  # audio or video or csv
+    logger.debug(f"[Receiver] Message on '{topic}'")
 
-        device_folder = INCOMING_DIR / device_id / filename
-        device_folder.mkdir(parents=True, exist_ok=True)
+    # Handle heartbeat messages (liveness tracking)
+    if topic.startswith("lab/heartbeat/"):
+        session_manager.update_heartbeat()
+        return  # Do NOT route further
 
-        chunk_path = device_folder / f"{index}.chunk"
+    parts = topic.split("/")
+    is_session_start = (
+        len(parts) == 4 and parts[1] == "session" and parts[2] == "start"
+    )
 
-        with open(chunk_path, "wb") as f:
-            f.write(file_bytes)
+    router.route(
+        topic=topic,
+        payload=payload,
+        on_new_data=_on_new_data_callback,
+    )
 
-        print(f"Received chunk {index+1}/{total} for {filename}")
+    # Forward session_start as an SSE event so the frontend can navigate to
+    # the new session. session_end is already fired inside
+    # session_manager.close_session() — firing it here too would double-send.
+    if _on_new_data_callback and is_session_start:
+        device_id = payload.get("device_id", parts[3])
+        session_id = session_manager.get_session(device_id) or ""
+        _on_new_data_callback(device_id, session_id, "session_start")
 
-        # Check if complete
-        received_chunks = list(device_folder.glob("*.chunk"))
-        if len(received_chunks) == total:
-            print(f"All chunks received for {filename}")
-            rebuild_file(device_id, filename, total, file_type)
-
-    except Exception as e:
-        print("Error:", e)
-
-# ==========================
-# FILE REBUILD
-# ==========================
-
-def rebuild_file(device_id, filename, total, file_type):
-    device_folder = INCOMING_DIR / device_id / filename
-    final_data = b""
-
-    for i in range(total):
-        chunk_path = device_folder / f"{i}.chunk"
-        with open(chunk_path, "rb") as f:
-            final_data += f.read()
-
-    # Choose destination
-    if file_type == "audio":
-        save_path = AUDIO_DIR / f"{device_id}_{filename}"
-    elif file_type == "video":
-        save_path = VIDEO_DIR / f"{device_id}_{filename}"
-    else:
-        save_path = BASE_DIR / "data" / f"{device_id}_{filename}"
-
-    with open(save_path, "wb") as f:
-        f.write(final_data)
-
-    print(f"Rebuilt file saved to {save_path}")
-
-    insert_into_db(device_id, file_type, filename, final_data.decode(errors="ignore"))
-
-    # Cleanup
-    for file in device_folder.glob("*.chunk"):
-        file.unlink()
-    device_folder.rmdir()
-
-# ==========================
-# INSERT INTO SQLITE
-# ==========================
-
-def insert_into_db(device_id, file_type, filename, content):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO measurements (device_id, file_type, filename, content)
-        VALUES (?, ?, ?, ?)
-    """, (device_id, file_type, filename, content))
-
-    conn.commit()
-    conn.close()
-
-    print(f"Inserted {filename} into database")
 
 # ==========================
 # MAIN
 # ==========================
 
-if __name__ == "__main__":
-    init_db()
+def start():
+    """
+    Initialize the database and start the MQTT listener.
+    Blocks forever via loop_forever().
+    """
+    logger.info("[Receiver] Initializing database...")
+    db_writer.init_db()
 
-    client = mqtt.Client()
+    client = mqtt.Client(client_id="LifeLens Server")
     client.username_pw_set(USERNAME, PASSWORD)
+
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
 
-    client.connect(BROKER, PORT, 60)
-    client.loop_forever()
+    client.connect(BROKER, PORT, keepalive=60)
+
+    logger.info("[Receiver] Starting MQTT listener...")
+    client.loop_forever()   # Blocks here — handles reconnects automatically
+
+
+if __name__ == "__main__":
+    start()

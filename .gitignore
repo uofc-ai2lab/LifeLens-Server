@@ -1,6 +1,8 @@
-config/passwordFile
-config/secure.conf
+config/
+tailscale_certs/
 venv/
 .venv/
 data/
-db/lab_data.db
+db/
+__pycache__/
+.env

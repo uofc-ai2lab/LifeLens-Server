@@ -1,0 +1,4 @@
+cryptography
+paho-mqtt
+fastapi
+uvicorn
