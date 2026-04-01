@@ -13,7 +13,8 @@ Usage:
 The two components are connected via the notify_new_data callback:
     db_writer → notify_new_data() → SSE queue → frontend
 """
-
+from dotenv import load_dotenv
+load_dotenv()  # Must be first — loads .env before any module reads os.getenv()
 from subscriber.settings import SSL_CERTIFILE, SSL_KEYFILE
 from subscriber.session_manager import set_session_event_callback, get_session, get_active_device_id
 from api.api_server import app, notify_new_data
@@ -22,8 +23,6 @@ import time
 import uvicorn
 import threading
 import logging
-from dotenv import load_dotenv
-load_dotenv()  # Must be first — loads .env before any module reads os.getenv()
 
 
 logging.basicConfig(
